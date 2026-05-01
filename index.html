@@ -9795,6 +9795,17 @@ const DUTCHIE_PROXY = url => 'https://corsproxy.io/?' + encodeURIComponent(url);
 const DUTCHIE_ENDPOINT = 'https://dutchie.com/api-4/graphql';
 const TRULIEVE_PRODUCT_PROXY_BASE = localStorage.getItem('pa_buddy_trulieve_proxy') || 'https://api.pabuddy.org/trulieve/product';
 
+/* Fetch with an AbortController timeout. Returns the Response or throws. */
+async function fetchWithTimeout(url, options, ms) {
+  const ctrl = new AbortController();
+  const tid = setTimeout(() => ctrl.abort(), ms);
+  try {
+    return await fetch(url, { ...options, signal: ctrl.signal });
+  } finally {
+    clearTimeout(tid);
+  }
+}
+
 async function dutchieFetch(body) {
   const targets = [];
   if (DUTCHIE_PROXY_BASE) targets.push(DUTCHIE_PROXY_BASE.replace(/\/+$/, '') + '/dutchie/graphql');
@@ -9803,14 +9814,15 @@ async function dutchieFetch(body) {
   let lastErr = null;
   for (const target of targets) {
     try {
-      const res = await fetch(target, {
+      /* 8 s per-relay timeout — lets the fallback fire instead of hanging. */
+      const res = await fetchWithTimeout(target, {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
           'x-apollo-operation-name': body.operationName || 'FilteredProducts',
         },
         body: JSON.stringify(body),
-      });
+      }, 8000);
       if (!res.ok) throw new Error('Dutchie HTTP ' + res.status);
       const json = await res.json();
       if (json && json.errors && json.errors.length) {
@@ -10876,7 +10888,12 @@ const PROVIDERS = {
   dutchie: {
     label: 'Dutchie',
     async fetchProducts(storeId) {
-      const r = await fetch(`https://api.pabuddy.org/menu/dutchie/${encodeURIComponent(storeId)}`);
+      /* 8 s timeout on the cache fetch — if pabuddy.org hangs, fail fast
+       * so the error screen appears quickly rather than freezing for minutes. */
+      const r = await fetchWithTimeout(
+        `https://api.pabuddy.org/menu/dutchie/${encodeURIComponent(storeId)}`,
+        {}, 8000
+      );
       if (!r.ok) throw new Error(`Cache HTTP ${r.status}`);
       const list = (await r.json()).data?.products || [];
       const all = [];
@@ -10928,9 +10945,44 @@ const PROVIDERS = {
   curaleaf: {
     label: 'Curaleaf shop',
     async fetchProducts(storeId) {
-      const r = await fetch(`https://api.pabuddy.org/menu/curaleaf/${encodeURIComponent(storeId)}`);
-      if (!r.ok) throw new Error(`Cache HTTP ${r.status}`);
-      const list = (await r.json()).data?.list || [];
+      /* Try the pabuddy cache first (fast). If it times out or errors, fall
+       * back to fetching directly from Sweed's paginated API — slower but
+       * reliable when the cache server is down. */
+      let list = null;
+      try {
+        const r = await fetchWithTimeout(
+          `https://api.pabuddy.org/menu/curaleaf/${encodeURIComponent(storeId)}`,
+          {}, 8000
+        );
+        if (r.ok) list = (await r.json()).data?.list || null;
+      } catch (e) {
+        console.warn('Curaleaf cache unavailable, falling back to direct Sweed API:', e);
+      }
+      if (!list) {
+        /* Direct Sweed fallback — paginated, no lab data pre-included. */
+        list = [];
+        const pageSize = 100;
+        let page = 1;
+        let total = null;
+        while (page <= 20) {
+          const res = await fetchWithTimeout(CURALEAF_API, {
+            method: 'POST',
+            headers: {
+              StoreId: String(storeId), TraceId: curaleafTraceId(),
+              SSR: 'false', Accept: '*/*', 'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ saleType: 'Medical', filters: {}, page, pageSize, platformOs: 'Web' }),
+          }, 12000);
+          if (!res.ok) throw new Error(`Curaleaf HTTP ${res.status}`);
+          const data = await res.json();
+          const page_list = Array.isArray(data.list) ? data.list : [];
+          total = Number.isFinite(Number(data.total)) ? Number(data.total) : total;
+          list.push(...page_list);
+          if (!page_list.length || page_list.length < pageSize) break;
+          if (total != null && page * pageSize >= total) break;
+          page++;
+        }
+      }
       const out = [];
       const seen = new Set();
       const normByRawId = new Map();
