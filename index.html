@@ -10547,10 +10547,24 @@ async function curaleafHydrateLabPage(storeId, list, onProgress) {
     const kind = curaleafKind(p);
     return kind === 'flower' || kind === 'vape' || kind === 'extract';
   });
-  /* Deduplicate by store-scoped product id using the cache */
+  /* Deduplicate by store-scoped product id using the in-memory cache */
   for (const p of targets) {
     const cached = _curaleafLabCache.get(_curaleafCacheKey(storeId, p.id));
     if (cached) { p._curaleafLabs = cached; }
+  }
+  /* If the api.pabuddy.org backend pre-fetches lab data and embeds it in the
+   * product object, use it directly — zero extra network calls needed.
+   * Backend can supply lab data under any of these field names. */
+  for (const p of targets) {
+    if (p._curaleafLabs) continue;
+    const embedded = p.labData || p._labData || p.extendedLab || p.terpeneData;
+    if (embedded) {
+      const labs = curaleafLabsFromPayload(embedded);
+      if (labs) {
+        p._curaleafLabs = labs;
+        _curaleafLabCache.set(_curaleafCacheKey(storeId, p.id), labs);
+      }
+    }
   }
   const needFetch = targets.filter(p => !p._curaleafLabs);
   /* Batch size 3 keeps concurrent lab requests low enough to avoid 429s
@@ -10956,6 +10970,9 @@ const PROVIDERS = {
           }];
         }
         scheduleDutchieHydrationRefresh(storeId);
+        /* After full hydration, overwrite the cache entry so the next visit
+         * loads with complete terpene data already populated — no extra calls. */
+        if (d >= n) writeProductCache(storeId, 'curaleaf', out);
       }).catch(() => {});
       return out;
     },
@@ -10988,6 +11005,34 @@ function updateProviderNotes() {
   }
 }
 
+/* ─── localStorage product cache (stale-while-revalidate) ───────────────────
+ * First visit: fetches normally. Every subsequent visit: cached products shown
+ * immediately, fresh data loads in background and updates the view silently.
+ * TTL 24 h. Silently skips writes in private/storage-full environments. */
+const _MENU_CACHE_TTL = 24 * 60 * 60 * 1000;
+function _menuCacheKey(storeId, provKey) {
+  return `buddy_v1_menu_${provKey}_${storeId}`;
+}
+function readProductCache(storeId, provKey) {
+  try {
+    const raw = localStorage.getItem(_menuCacheKey(storeId, provKey));
+    if (!raw) return null;
+    const data = JSON.parse(raw);
+    if (!data || !Array.isArray(data.products) || !data.products.length) return null;
+    if (Date.now() - (data.ts || 0) > _MENU_CACHE_TTL) return null;
+    return data.products;
+  } catch (e) { return null; }
+}
+function writeProductCache(storeId, provKey, products) {
+  if (!products || !products.length) return;
+  try {
+    localStorage.setItem(_menuCacheKey(storeId, provKey), JSON.stringify({
+      ts: Date.now(),
+      products,
+    }));
+  } catch (e) { /* storage full or private mode — silently skip */ }
+}
+
 function ensureLoadingScreen() {
   const screen = document.getElementById('screen-loading');
   if (!screen || document.getElementById('loading-sub')) return;
@@ -11006,34 +11051,44 @@ async function loadMenu() {
   const storeName = store?.name || 'this location';
   const brand = BRAND_BY_ID[(store && store.brandId) || state.selBrandId];
   const brandName = brand?.name || 'this dispensary';
-  ensureLoadingScreen();
-  setToast('loading', `Connecting to ${brandName} ${storeName}...`);
   const provKey = brandProviderKey();
   const provider = PROVIDERS[provKey] || PROVIDERS.jane;
-  const loadingTitle = document.getElementById('loading-title');
-  const loadingSub = document.getElementById('loading-sub');
-  if (loadingTitle) {
-    loadingTitle.textContent = `Loading ${brandName} menu...`;
-  }
-  if (loadingSub) {
-    loadingSub.textContent = provKey === 'curaleaf'
-      ? `Pulling live inventory for ${brandName} ${storeName}. Terp details load as you browse.`
-      : provKey === 'dutchie'
+  const sourceMeta = {
+    sourceProvider: provKey,
+    sourceStoreId: String(storeId),
+    sourceStoreName: storeName,
+    sourceBrandName: brandName,
+  };
+
+  /* Stale-while-revalidate: show cached products immediately so repeat
+   * visits to any store (including slow Curaleaf/Liberty) are instant.
+   * Fresh data loads in the background and updates the view silently. */
+  const cachedProducts = readProductCache(storeId, provKey);
+  const hasCacheHit = !!(cachedProducts && cachedProducts.length);
+  if (hasCacheHit) {
+    state.products = cachedProducts;
+    for (const p of state.products) Object.assign(p, sourceMeta);
+    renderCategoryGrid();
+    setScreen('category');
+    setToast('ok', `${storeName} (cached) · refreshing…`);
+    setTimeout(() => document.getElementById('toast')?.classList.add('hidden'), 2000);
+  } else {
+    ensureLoadingScreen();
+    setToast('loading', `Connecting to ${brandName} ${storeName}...`);
+    const loadingTitle = document.getElementById('loading-title');
+    const loadingSub = document.getElementById('loading-sub');
+    if (loadingTitle) loadingTitle.textContent = `Loading ${brandName} menu...`;
+    if (loadingSub) {
+      loadingSub.textContent = (provKey === 'curaleaf' || provKey === 'dutchie')
         ? `Pulling live inventory for ${brandName} ${storeName}. Terp details load as you browse.`
         : `Pulling live inventory for ${brandName} ${storeName}.`;
+    }
   }
+
   try {
     const products = await provider.fetchProducts(storeId);
     if (token !== state.menuLoadToken || storeId !== state.storeId) return;
     state.products = products;
-    /* Attach source metadata for future multi-store grouping.
-     * In single-store mode these fields sit idle — no rendering code reads them yet. */
-    const sourceMeta = {
-      sourceProvider: provKey,
-      sourceStoreId: String(storeId),
-      sourceStoreName: storeName,
-      sourceBrandName: brandName,
-    };
     for (const p of state.products) Object.assign(p, sourceMeta);
     /* Resilience: if an adapter returns an empty list we surface it
      * clearly rather than dumping the patient into an empty category
@@ -11042,12 +11097,26 @@ async function loadMenu() {
     if (!state.products.length) {
       throw Object.assign(new Error('Menu returned zero products — integration may be out of date.'), { _emptyMenu: true });
     }
-    setToast('ok', `OK ${storeName} loaded - ${state.products.length.toLocaleString()} products`);
-    setTimeout(() => document.getElementById('toast').classList.add('hidden'), 2800);
+    /* Persist to localStorage so next visit is instant. */
+    writeProductCache(storeId, provKey, products);
+    setToast('ok', `${storeName} loaded · ${state.products.length.toLocaleString()} products`);
+    setTimeout(() => document.getElementById('toast')?.classList.add('hidden'), 2800);
     renderCategoryGrid();
-    setScreen('category');
+    if (hasCacheHit) {
+      /* Already navigated to category from cache — update in place.
+       * If the user drilled into results, refresh that too. */
+      if (state.screen === 'results') scheduleResultsRender();
+    } else {
+      setScreen('category');
+    }
   } catch (e) {
     if (token !== state.menuLoadToken || storeId !== state.storeId) return;
+    if (hasCacheHit) {
+      /* Don't clobber a working cached menu with an error message. */
+      setToast('fail', `Couldn't refresh ${storeName} — showing cached menu`);
+      setTimeout(() => document.getElementById('toast')?.classList.add('hidden'), 3500);
+      return;
+    }
     console.error(e);
     const adapterMissing = e && e._adapterMissing;
     const emptyMenu = e && e._emptyMenu;
