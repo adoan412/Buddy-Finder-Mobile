@@ -10510,9 +10510,13 @@ async function curaleafFetchExtendedLabs(storeId, product) {
   const variant = variants[0] || (product?.variants || [])[0];
   if (!product?.id || !variant?.id) return null;
   const candidates = curaleafLabBodies(product, variant);
+  /* Discovery phase: try all 4 body shapes until one works, then lock in.
+   * Once _curaleafLabParamStyle is set, only try that one format — a 400
+   * on the known-good format means this product has no lab data, so bail
+   * immediately rather than firing 3 more failing requests per product. */
   const order = _curaleafLabParamStyle == null
     ? candidates.map((_, i) => i)
-    : [_curaleafLabParamStyle, ...candidates.map((_, i) => i).filter(i => i !== _curaleafLabParamStyle)];
+    : [_curaleafLabParamStyle];
   for (const style of order) {
     try {
       const res = await fetch(CURALEAF_LABS_API, {
@@ -10534,7 +10538,12 @@ async function curaleafFetchExtendedLabs(storeId, product) {
         console.warn('Curaleaf lab API 429 — pausing hydration for 8s');
         return null;
       }
-      if (!res.ok) continue;
+      /* 400 on the known-good format = no lab data for this product.
+       * Stop immediately — don't burn more requests on other formats. */
+      if (!res.ok) {
+        if (_curaleafLabParamStyle != null) return null;
+        continue;
+      }
       const labs = curaleafLabsFromPayload(await res.json());
       if (labs) {
         _curaleafLabParamStyle = style;
